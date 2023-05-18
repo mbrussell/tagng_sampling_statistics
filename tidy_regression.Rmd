@@ -1,0 +1,198 @@
+---
+title: "Modeling with tidymodels"
+author: "Matt Russell"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r}
+# Read in the packages
+
+library(tidyverse)
+library(modelr)
+library(tidymodels)
+library(gsheet)
+```
+
+```{r}
+# Read in the data
+tree_in <- gsheet2tbl("https://docs.google.com/spreadsheets/d/1HbczWJRzqxSo-mulXkL9PMMV5u45aoWkc8jD_hfSVpI/edit?usp=sharing")
+
+# Make a species file
+spp <- tibble (
+  SPCD = c(131, 110, 111, 121, 132, 611, 129),
+  Species = c("Loblolly pine", "Shortleaf pine", "Slash pine", 
+              "Longleaf pine", "Virginia pine", "Sweetgum", "Eastern white pine")
+)
+
+# Merge tree and species file
+tree2 <- inner_join(tree_in, spp)
+
+tree <- tree2 %>% 
+  filter(!is.na(ST_OB_D_BH),
+         !is.na(AG_DW))
+
+# Summarize the tree data
+tree_summary <- tree %>% 
+  group_by(Species) %>% 
+  summarize(`Num trees` = n(),
+            `Mean DBH` = round(mean(ST_OB_D_BH, na.rm=T), 1),
+            `Max DBH` = max(ST_OB_D_BH, na.rm=T),
+            `Min DBH` = min(ST_OB_D_BH, na.rm=T),
+            `Mean weight`= round(mean(AG_DW, na.rm=T), 1),
+            `Max weight` = max(AG_DW, na.rm=T),
+            `Min weight` = min(AG_DW, na.rm=T))%>% 
+  arrange(desc(`Num trees`))
+
+tree_summary
+```
+
+## Tree biomass data
+
+The goal: fit a series of models that determine the aboveground biomass of trees using tree diameter as a predictor variable. I've gathered data from [LegacyTreeData](http://www.legacytreedata.org/), an online repository of individual tree measurements such as volume, weight, and wood density. I queried the database to provide all tree measurements from the US State of Georgia. 
+
+After the query, there are 608 observations from seven species that contain a value for the tree's diameter at breast height, measured in inches (`ST_OB_D_BH`) and its aboveground dry weight in pounds (`AG_DW`).  
+
+Let's see the data:
+
+```{r}
+ggplot(tree, aes(ST_OB_D_BH, AG_DW, col = Species)) +
+  geom_point() +
+  labs(x = "Diameter at breast height (inches)", 
+       y = "Aboveground dry weight (pounds)") +
+  theme(panel.background = element_rect(fill = "NA"),
+        axis.line = element_line(color = "black"))
+```
+
+The data contain relatively small trees, with DBH ranging values from 0.7 to 8.5 inches. There are at least 40 observations for seven primary species common to Georgia. These are mostly different kinds of pine trees in addition to one hardwood tree (sweetgum):
+
+## Models of aboveground tree biomass
+
+To start our modeling analysis, we can fit a model predicting aboveground dry weight using tree diameter. From above, we can see a clear nonlinear trend in the data, indicating that a nonlinear model is best.
+
+We can fit a nonlinear model using `nls()` to all observations in the data set:
+
+```{r}
+bio_pred <- as.formula(AG_DW ~ exp(b0 + b1*log(ST_OB_D_BH)))
+
+start_vals <- list(b0 = -2.5356, b1 = 2.4349)
+
+mod.biomass <- nls(bio_pred,
+             start = start_vals,
+             data = tree)
+summary(mod.biomass)
+```
+
+Chapter 24 in the popular book [R for Data Science](https://r4ds.had.co.nz/model-building.html) discusses making a grid of data to investigate model predictions. In this step, I'll use the `data_grid()` function to generate a grid of data points. Then, I'll use the `add_predictions()` function to add the model predictions from `tree_mod` to complete our data grid. 
+
+The model appears to perform well:
+
+```{r}
+grid <- tree %>% 
+  data_grid(ST_OB_D_BH = seq_range(ST_OB_D_BH, 20)) %>% 
+  add_predictions(mod.biomass, "AG_DW") 
+
+ggplot(tree, aes(ST_OB_D_BH, AG_DW)) +
+  geom_point() +
+  geom_line(data = grid, color = "red", linewidth = 1) +
+    labs(x = "Diameter at breast height (inches)", 
+       y = "Aboveground dry weight (pounds)")
+```
+
+A data analyst's best friend in the tidyverse is the `group_by` statement. We can fit the same model as we did earlier, but this time I'll specify it for each of the seven species using `group_by`. The `tidy()` function available in the  [broom package](https://cran.r-project.org/web/packages/broom/vignettes/broom.html) provides a set of functions that put model output into data frames.
+
+Here, we can see that the species have a different set of coefficients and other attributes like p-values: 
+
+```{r}
+tree_coef <- tree %>% 
+  group_by(Species) %>% 
+   do(tidy(nls(bio_pred, . ,
+              start = start_vals)))
+tree_coef
+```
+
+A way to visualize the species differences is to plot the intercept and slope coefficients with standard errors. Here we can see that all errors bars do not overlap with zero, indicating they're good models: 
+
+```{r}
+ggplot(tree_coef, aes(estimate, 1)) +
+    geom_point() +
+    geom_errorbarh(aes(xmin = estimate - (2*std.error), 
+                       xmax = estimate + (2*std.error),
+                       height = 0.25)) +
+  scale_y_continuous(limits = c(0,2))+
+  facet_grid(term~Species)+
+  labs(x = "Coefficient", y = " ")+
+  ggtitle("Coefficients for determining aboveground dry weight \n(+/- two standard errors) for seven tree species")+
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+```
+
+## Analysis of model predictions
+
+Aside from coefficients, we might be interested in species-specific predictions from a model. The `nest()` function creates a list of data frames containing all the nested variables in an object. I think of a nested data frame as a "data frame containing many data frames". 
+
+The `by_spp` object will store this list of data frames for each species so that we can work with them:
+
+```{r}
+by_spp <- tree %>% 
+  group_by(Species) %>% 
+  nest()
+
+species_model <- function(df){
+  nls(bio_pred, 
+      start = start_vals,
+      data = tree)
+  }
+
+models <- map(by_spp$data, species_model)
+
+by_spp <- by_spp %>% 
+  mutate(model = map(data, species_model))
+
+by_spp
+```
+
+Similar to what we did above to the all-species equation, we can map the model predictions to the nested object, adding another variable called `preds`:
+
+```{r}
+by_spp <- by_spp %>% 
+  mutate(preds = map2(data, model, add_predictions))
+
+by_spp
+```
+
+Then, we can unnest the model predictions. Unnesting is the opposite of what we've done in the previous step. This time we're taking the nested data frame and turning it into a "regular" data frame.
+
+The model predictions can now be visualized by species to better understand differences in aboveground biomass:
+
+```{r}
+preds <- unnest(by_spp, preds)
+
+ggplot(preds, aes(ST_OB_D_BH, pred)) +
+  geom_line(aes(group = Species), size = 1) +
+  labs(x = "Diameter at breast height (inches)", 
+       y = "Predicted aboveground\ndry weight (pounds)")+
+  facet_wrap(~Species)
+
+```
+
+## Analysis of model residuals
+
+Any good data analysis involving modeling will also analyze the residuals. Just like we added model predictions with the `add_predictions` function and nesting/unnesting, we can add residuals with the `add_residuals` statement:
+
+```{r}
+by_spp <- by_spp %>% 
+  mutate(resids = map2(data, model, add_residuals))
+
+by_spp
+
+resids <- unnest(by_spp, resids)
+
+ggplot(resids, aes(ST_OB_D_BH, resid)) +
+  geom_point(aes(group = Species), alpha = 1/3) +
+  geom_smooth(se = F) +
+      labs(x = "Diameter at breast height (inches)", 
+       y = "Residual")+
+  geom_abline(intercept = 0, slope = 0, color = "red")+
+  facet_wrap(~Species)
+```

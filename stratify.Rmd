@@ -1,0 +1,134 @@
+---
+title: "Stratification with forestsamplr"
+author: "Matt Russell"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+Read in libraries to use:
+
+```{r}
+library(gsheet)
+library(devtools)
+library(tidyverse)
+```
+
+Install/read in the **forestsamplr** package:
+
+```{r}
+# devtools::install_github("SilviaTerra/forest_sampling")
+library(forestsamplr)
+```
+
+Read in data from the [Penobscot Experimental Forest](https://crsf.umaine.edu/forest-research/penobscot-experimental-forest/). We'll use data from four stands or "management units": two are managed silviculturally on a five-year selection interval and two on a ten-year selection interval:
+
+```{r}
+tree <- gsheet2tbl('https://docs.google.com/spreadsheets/d/19XgWp2naizuqvSSr-DlJ0r-53IBgQd8X7yDx_KjkWWE/edit?usp=sharing')
+
+# Select only the last year of measurement from each management unit
+
+tree <- subset(tree, (MgmtUnit == 20 & Year == 2008 & DBH >= 0) |
+               (MgmtUnit == 9 & Year == 2013 & DBH >= 0) |
+               (MgmtUnit == 12 & Year == 2014 & DBH >= 0) |
+               (MgmtUnit == 16 & Year == 2012 & DBH >= 0))
+```
+
+Assume the 68 plots were sampled randomly across these four stands, representing a simple random sample: 
+
+```{r }
+# Summarize data to calculate basal area
+
+plot <- tree %>%
+  group_by(MgmtUnit, Plot) %>%
+  summarize(BA = sum((DBH**2)*0.00545415*EXPF)) %>% 
+  mutate(stratum = as.numeric(MgmtUnit), 
+         trmt = ifelse(MgmtUnit %in% c(9, 16), "Five-year selection", "Ten-year selection"))
+
+# Summarize the data by stand/management unit
+mgmt_unit <- plot %>%
+  group_by(stratum) %>%
+  summarize(n_plots = n(),
+            mean_BA = mean(BA),
+            sd_BA = sd(BA))
+```
+
+We'll visualize the data: 
+
+```{r}
+ggplot(plot, aes(x = factor(stratum), y = BA, fill = trmt)) +
+  geom_violin() +
+  labs(x = "StandID",
+       y ="Basal area (sq. ft per acre)") 
+``` 
+
+Assuming a simple random sample, the population mean of basal area can be calculated using the `summarize_all_srs()` function. A 95% confidence interval is provided in the output:
+
+```{r}
+plot <- as.data.frame(plot)
+
+srs95 <- summarize_all_srs(plot, attribute = "BA")
+srs95
+```
+
+Let's see how a 66 percent confidence interval looks by changing the `desiredConfidence` statement:
+
+```{r}
+srs66 <- summarize_all_srs(plot, attribute = "BA", desiredConfidence = 0.66)
+srs66
+```
+
+In stratified random sampling, we need to know the area of each of the stands (in our case, acres), which we can create in the `stratumTab` data frame:
+
+```{r}
+stratumTab <- tibble(stratum = c(9, 12, 16, 20), 
+                     acres = c(27.2, 31.3, 16.3, 21.2))
+```
+
+The population mean of `BAPA` can be calculated using the `summarize_stratified()` function in forestsamplr, which requires the `stratumTab` argument that contains the area of each stand. Output is provided for each stand (`$stratumSummaries`), and then for the entire area (`$totalSummary`):
+
+```{r}
+strat95 <- summarize_stratified(plot, attribute = "BA",  stratumTab)
+strat95
+```
+
+NOTE: The population mean for the stratified sample is slightly larger than for the SRS (166.87 vs. 160.45 sq. ft per acre). The standard error is reduced from 3.83 to 3.80 sq. ft per acre when stratifying. 
+
+In the sample of field plots at the PEF, it turns out they were laid out in a generally systematic fashion across each stand, ranging from 13 plots in stand 9 to 21 plots in stand 20. Knowing what we now know about the variability within each strata, we could allocate the number of field plots to each stand in a few different ways.
+
+Described in Burkhart et al.'s [*Forest Measurements*](https://www.waveland.com/browse.php?t=668&r=a), there are two common ways to allocate field plots in a stratified random sample: through **proportional** or **optimal** allocation.
+
+## Proportional allocation
+
+Say we were interested in taking 150 new field plots across the four stands to estimate `BA`. Proportional allocation would distribute the 150 field plots according to their total area. That is, take more field plots in larger area stands. The `prop_allocate` function allocates the total number of desired plots to each of the stratum. We can apply the function to the `stratumTab` data frame:
+
+```{r}
+prop_allocate <- function(acres_stratum, total_acres, total_plots){
+  num_plots = round((acres_stratum / total_acres) * total_plots)
+  return(num_plots)}
+
+stratumTab$n_prop <- prop_allocate(acres_stratum = stratumTab$acres, 
+                                   total_acres = sum(stratumTab$acres), 
+                                   total_plots = 150)
+stratumTab
+```
+
+## Optimal allocation
+
+The optimal allocation method distributes the 150 field plots to each stratum that provides the smallest amount of variability possible. In addition to the total area, also required in this calculation is the standard deviation of `BA` within each stratum. The total number of plots to sample in each stand would be represented by the stratum area multiplied by the standard deviation of `BAPA`. The `opt_allocate` function allocates the total number of desired plots to each of the stratum, and we can apply it to the `stratumTab` data frame:
+
+```{r}
+stratumTab <- merge(stratumTab, mgmt_unit, by = c("stratum"))
+stratumTab$area_sd <- stratumTab$acres * stratumTab$sd_BA
+```
+
+```{r}
+opt_allocate <- function(area_sd ,sum_area_sd, total_plots){
+  num_plots = round((area_sd / sum_area_sd) * total_plots)
+  return(num_plots)}
+
+stratumTab$n_opt <- opt_allocate(area_sd = stratumTab$area_sd,
+                                 sum_area_sd = sum(stratumTab$area_sd),
+                                 total_plots = 150)
+stratumTab[,c(1,2,5,6,3,8)]
+```
+
